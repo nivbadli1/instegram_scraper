@@ -61,9 +61,23 @@ run on, the report is reliable.
 Options:
 
 ```bash
+python track_follows.py --thorough             # get the complete lists (slow, see below)
 python track_follows.py --target other_user   # track a different account this run
 python track_follows.py --headed               # show the browser window
 ```
+
+### Getting the complete lists: `--thorough`
+
+The normal fetch returns only part of each list (see below). `--thorough`
+additionally sweeps the list's search box for every username prefix
+(`a`, `b`, ... `9`, `.`, `_`), drilling into longer prefixes when a page is
+full, and unions everything it finds. That is a few hundred requests and
+takes 5 to 15 minutes, but it gets the lists to (or within a handful of
+deactivated accounts of) the counts shown on the profile.
+
+Use it for the first baseline and then occasionally, for example weekly.
+Daily runs can stay without it: the verification step keeps the snapshot
+accurate for people already known.
 
 ## Files created
 

@@ -330,11 +330,59 @@ def reconcile(page: Page, prev: dict, curr: dict) -> dict:
     return pending
 
 
-def take_snapshot(page: Page, user_id, username, full_name, rep_followers, rep_following) -> dict:
+# Username characters, most common first so the page-size cap is learned early.
+SWEEP_ALPHABET = "asmlejdnrtkbcgiohyfpvzwuxq0123456789._"
+SWEEP_COUNT = 50
+SWEEP_CAP_MIN = 20  # a page must be at least this big to be considered "capped"
+
+
+def search_sweep(page: Page, user_id: str, kind: str, expected, found: dict) -> None:
+    """Fill `found` by querying the list's search box for every username
+    prefix. The paginated list endpoint caps what it returns, but the search
+    is far more complete. When a prefix returns a full page (Instagram caps
+    search results), drill into longer prefixes so nothing is cut off."""
+    queue = list(SWEEP_ALPHABET)
+    max_seen = 0
+    requests = 0
+    while queue:
+        if expected is not None and len(found) >= expected:
+            break
+        prefix = queue.pop(0)
+        path = (f"api/v1/friendships/{user_id}/{kind}/?count={SWEEP_COUNT}"
+                f"&search_surface=follow_list_page&query={quote(prefix)}")
+        data = api_get(page, path, retries=5, fatal=False) or {}
+        requests += 1
+        users = data.get("users", [])
+        for u in users:
+            found[str(u["pk"])] = {"username": u["username"],
+                                   "full_name": u.get("full_name") or ""}
+        max_seen = max(max_seen, len(users))
+        # A page as large as the largest we've seen (and not tiny) may be capped.
+        capped = len(users) >= max_seen and max_seen >= SWEEP_CAP_MIN and not data.get("next_max_id")
+        if capped and len(prefix) < 3:
+            queue = [prefix + c for c in SWEEP_ALPHABET] + queue
+        print(f"\r  Sweep '{prefix}': {len(found)} {kind} total after {requests} searches",
+              end="", flush=True)
+        time.sleep(random.uniform(1.0, 2.0))
+    print()
+
+
+def take_snapshot(page: Page, user_id, username, full_name, rep_followers, rep_following,
+                  thorough: bool = False) -> dict:
     print(f"Fetching who @{username} follows ...")
     following = fetch_list(page, user_id, "following", rep_following)
     print(f"Fetching who follows @{username} ...")
     followers = fetch_list(page, user_id, "followers", rep_followers)
+    if thorough:
+        for kind, lst, exp in (("following", following, rep_following),
+                               ("followers", followers, rep_followers)):
+            if exp is not None and len(lst) >= exp:
+                continue
+            print(f"Thorough sweep of {kind} via the list search ...")
+            before = len(lst)
+            search_sweep(page, user_id, kind, exp, lst)
+            shown = f" of {exp} on profile" if exp is not None else ""
+            print(f"  Sweep added {len(lst) - before}; now {len(lst)} {kind}{shown}")
     return {
         "taken_at": datetime.now().isoformat(timespec="seconds"),
         "target": {"user_id": user_id, "username": username, "full_name": full_name,
@@ -509,6 +557,10 @@ def main():
                         help="Instagram username to track (default: IG_TARGET from .env)")
     parser.add_argument("--headed", action="store_true",
                         help="show the browser window even when already logged in")
+    parser.add_argument("--thorough", action="store_true",
+                        help="also sweep the list search letter by letter to get the "
+                             "complete lists (slow, a few hundred requests; use for the "
+                             "baseline or occasionally)")
     args = parser.parse_args()
     if not args.target:
         sys.exit("No target given. Set IG_TARGET=<username> in .env or pass --target.")
@@ -519,7 +571,8 @@ def main():
             user_id, username, full_name, rep_flw, rep_fng = resolve_target(page, args.target)
             shown = f" ({rep_flw} followers, {rep_fng} following on profile)" if rep_flw else ""
             print(f"Tracking @{username} ({full_name}), id {user_id}{shown}")
-            curr = take_snapshot(page, user_id, username, full_name, rep_flw, rep_fng)
+            curr = take_snapshot(page, user_id, username, full_name, rep_flw, rep_fng,
+                                 thorough=args.thorough)
             pending = None
             latest_file = DATA_DIR / username / "latest.json"
             if latest_file.exists():
