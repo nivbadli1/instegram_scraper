@@ -36,9 +36,24 @@ python track_follows.py
   started following, unfollowed, username changes) and saves both the new
   snapshot and the change report.
 
-The script also reads the follower / following counts shown on the profile
-and tells you if the downloaded lists are shorter. A small gap is normal:
-Instagram counts deactivated and restricted accounts that it never lists.
+### Why the numbers are lower than the profile shows
+
+Instagram never returns the complete followers / following list in one pass.
+Each run typically gets around 80 % of it, and the part that is missing
+changes from run to run. (A few percent on top of that are deactivated or
+restricted accounts that Instagram counts but never lists.)
+
+To keep the change report accurate anyway, the script does two things:
+
+- Anyone who was in the previous snapshot but did not show up in this run's
+  fetch is checked individually through the list's own search box. Only
+  people confirmed absent are reported as lost / unfollowed.
+- People confirmed still present are kept in the snapshot, so the saved list
+  fills in toward the true total over a few runs.
+
+The first run after an incomplete baseline will therefore report a burst of
+"new" people that are really just ones the baseline missed. From the second
+comparison on, the report is reliable.
 
 Options:
 
@@ -74,7 +89,8 @@ session and personal data.
 
 - The target account must be visible to your account (public, or private and
   you follow it).
-- Instagram rate-limits aggressively. Do not run this more than a few times a
-  day. Large accounts (tens of thousands of followers) take a while.
+- Instagram rate-limits aggressively. Once or twice a day is safe; several
+  runs within an hour will get you throttled (the script waits and retries,
+  but it gets slow). Large accounts take a while.
 - If Instagram logs you out or asks you to confirm the login, delete
   `browser_profile/` and run again to log in fresh.

@@ -38,6 +38,7 @@ IG_URL = "https://www.instagram.com/"
 IG_APP_ID = "936619743392459"  # public app id the Instagram web client sends
 PAGE_SIZE = 25
 LOGIN_TIMEOUT_S = 600  # how long to wait for you to log in manually
+MAX_VERIFY = 200       # max individual "is this person still there?" checks per run
 
 
 # --------------------------------------------------------------------------- #
@@ -253,10 +254,54 @@ def fetch_list(page: Page, user_id: str, kind: str, expected) -> dict:
     if expected is None:
         print(f"  (profile count unavailable, so cannot check whether {len(users)} is complete)")
     elif len(users) < expected:
-        print(f"  Note: profile shows {expected} {kind}, got {len(users)}. "
-              "A small gap is deactivated or restricted accounts that Instagram "
-              "counts but does not list.")
+        print(f"  Profile shows {expected} {kind}, fetched {len(users)}. Instagram never "
+              "returns the full list in one pass; the saved list fills in over runs.")
     return users
+
+
+def verify_still_present(page: Page, user_id: str, kind: str, candidates: dict):
+    """Instagram never hands out the complete list in one pass, so someone
+    missing from today's fetch is not necessarily gone. Ask the list's own
+    search box about each one. Returns (still_present, gone, unverified)."""
+    still, gone, unverified = {}, {}, {}
+    items = list(candidates.items())
+    for i, (uid, u) in enumerate(items, 1):
+        if i > MAX_VERIFY:
+            unverified[uid] = u
+            continue
+        print(f"\r  Verifying {kind} not seen this run: {i}/{min(len(items), MAX_VERIFY)}",
+              end="", flush=True)
+        path = (f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
+                f"&search_surface=follow_list_page&query={quote(u['username'])}")
+        data = api_get(page, path, retries=5, fatal=False)
+        if data is None:
+            unverified[uid] = u
+            continue
+        hit = next((x for x in data.get("users", []) if str(x["pk"]) == uid), None)
+        if hit:
+            still[uid] = {"username": hit["username"], "full_name": hit.get("full_name") or ""}
+        else:
+            gone[uid] = u
+        time.sleep(random.uniform(1.0, 2.0))
+    if items:
+        print()
+    return still, gone, unverified
+
+
+def reconcile(page: Page, prev: dict, curr: dict) -> None:
+    """Merge people from the previous snapshot who were not fetched this run
+    but are confirmed still present, so the list converges to the truth."""
+    for kind in ("following", "followers"):
+        missing = {k: v for k, v in prev[kind].items() if k not in curr[kind]}
+        if not missing:
+            continue
+        still, gone, unverified = verify_still_present(page, curr["target"]["user_id"], kind, missing)
+        curr[kind].update(still)
+        curr[kind].update(unverified)  # assume present until we can check
+        msg = f"  {kind}: {len(missing)} missing from this fetch, {len(still)} confirmed still there, {len(gone)} confirmed gone"
+        if unverified:
+            msg += f", {len(unverified)} left unverified (kept, checked next run)"
+        print(msg)
 
 
 def take_snapshot(page: Page, user_id, username, full_name, rep_followers, rep_following) -> dict:
@@ -440,6 +485,10 @@ def main():
             shown = f" ({rep_flw} followers, {rep_fng} following on profile)" if rep_flw else ""
             print(f"Tracking @{username} ({full_name}), id {user_id}{shown}")
             curr = take_snapshot(page, user_id, username, full_name, rep_flw, rep_fng)
+            latest_file = DATA_DIR / username / "latest.json"
+            if latest_file.exists():
+                prev = json.loads(latest_file.read_text(encoding="utf-8"))
+                reconcile(page, prev, curr)
         finally:
             context.close()
 
