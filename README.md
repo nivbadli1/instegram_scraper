@@ -75,6 +75,12 @@ full, and unions everything it finds. That is a few hundred requests and
 takes 5 to 15 minutes, but it gets the lists to (or within a handful of
 deactivated accounts of) the counts shown on the profile.
 
+Each thorough run is capped at 450 searches per list and stops early if
+Instagram starts refusing requests, keeping everything found so far. The
+sweep starts from a different letter each time, so if one run is cut short
+the next `--thorough` run fills in the rest. Ctrl-C during the sweep or the
+verification also keeps what was found and saves normally.
+
 Use it for the first baseline and then occasionally, for example weekly.
 Daily runs can stay without it: the verification step keeps the snapshot
 accurate for people already known.

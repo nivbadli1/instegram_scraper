@@ -115,9 +115,21 @@ async ([url, appId]) => {
 """
 
 
-def api_get(page: Page, path: str, retries: int = 4, fatal: bool = True):
+_throttled = False  # set once Instagram keeps refusing; optional calls then skip
+
+
+def api_get(page: Page, path: str, retries: int = 4, fatal: bool = True,
+            bulk: bool = False):
     """GET an Instagram web API path. Returns parsed JSON, or None if not
-    fatal and every attempt failed."""
+    fatal and every attempt failed.
+
+    bulk=True marks the many small calls of the sweep / verification: once
+    one of those has exhausted its retries, the rest return None immediately
+    so the run wraps up and saves instead of waiting for hours. (The profile
+    lookups at the start are throttled separately and must not trigger this.)"""
+    global _throttled
+    if _throttled and bulk:
+        return None
     url = IG_URL + path.lstrip("/")
     for attempt in range(1, retries + 1):
         res = page.evaluate(_FETCH_JS, [url, IG_APP_ID])
@@ -145,6 +157,11 @@ def api_get(page: Page, path: str, retries: int = 4, fatal: bool = True):
     if fatal:
         sys.exit(f"Giving up on {path}. Instagram is rate limiting you; "
                  "wait an hour and run again.")
+    if bulk:
+        if not _throttled:
+            print("\n  Instagram is refusing further requests for now; skipping the rest "
+                  "of the optional checks and saving what we have.")
+        _throttled = True
     return None
 
 
@@ -275,14 +292,14 @@ def verify_still_present(page: Page, user_id: str, kind: str, candidates: dict):
                   "(Ctrl-C to skip the rest and save)", end="", flush=True)
             path = (f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
                     f"&search_surface=follow_list_page&query={quote(u['username'])}")
-            data = api_get(page, path, retries=5, fatal=False)
+            data = api_get(page, path, retries=5, fatal=False, bulk=True)
             if data is None:
                 unverified[uid] = u
                 continue
             hit = next((x for x in data.get("users", []) if str(x["pk"]) == uid), None)
             if not hit:  # the list search misses sometimes; try once more
                 time.sleep(random.uniform(2.0, 3.0))
-                data = api_get(page, path, retries=3, fatal=False) or {}
+                data = api_get(page, path, retries=3, fatal=False, bulk=True) or {}
                 hit = next((x for x in data.get("users", []) if str(x["pk"]) == uid), None)
             if hit:
                 still[uid] = {"username": hit["username"], "full_name": hit.get("full_name") or ""}
@@ -333,6 +350,7 @@ def reconcile(page: Page, prev: dict, curr: dict) -> dict:
 # Username characters, most common first so the page-size cap is learned early.
 SWEEP_ALPHABET = "asmlejdnrtkbcgiohyfpvzwuxq0123456789._"
 SWEEP_COUNT = 50
+SWEEP_MAX_REQUESTS = 450  # per list per run; more than this in one go gets you throttled
 SWEEP_CAP_MIN = 20  # a page must be at least this big to be considered "capped"
 
 
@@ -341,30 +359,46 @@ def search_sweep(page: Page, user_id: str, kind: str, expected, found: dict) -> 
     prefix. The paginated list endpoint caps what it returns, but the search
     is far more complete. When a prefix returns a full page (Instagram caps
     search results), drill into longer prefixes so nothing is cut off."""
+    # Random top-level order so that a run cut short by the request cap
+    # covers different letters next time; results accumulate across runs.
     queue = list(SWEEP_ALPHABET)
+    random.shuffle(queue)
     max_seen = 0
     requests = 0
-    while queue:
-        if expected is not None and len(found) >= expected:
-            break
-        prefix = queue.pop(0)
-        path = (f"api/v1/friendships/{user_id}/{kind}/?count={SWEEP_COUNT}"
-                f"&search_surface=follow_list_page&query={quote(prefix)}")
-        data = api_get(page, path, retries=5, fatal=False) or {}
-        requests += 1
-        users = data.get("users", [])
-        for u in users:
-            found[str(u["pk"])] = {"username": u["username"],
-                                   "full_name": u.get("full_name") or ""}
-        max_seen = max(max_seen, len(users))
-        # A page as large as the largest we've seen (and not tiny) may be capped.
-        capped = len(users) >= max_seen and max_seen >= SWEEP_CAP_MIN and not data.get("next_max_id")
-        if capped and len(prefix) < 3:
-            queue = [prefix + c for c in SWEEP_ALPHABET] + queue
-        print(f"\r  Sweep '{prefix}': {len(found)} {kind} total after {requests} searches   ",
-              end="", flush=True)
-        time.sleep(random.uniform(1.0, 2.0))
+    stopped = None
+    try:
+        while queue:
+            if expected is not None and len(found) >= expected:
+                break
+            if requests >= SWEEP_MAX_REQUESTS:
+                stopped = f"request cap of {SWEEP_MAX_REQUESTS} reached"
+                break
+            prefix = queue.pop(0)
+            path = (f"api/v1/friendships/{user_id}/{kind}/?count={SWEEP_COUNT}"
+                    f"&search_surface=follow_list_page&query={quote(prefix)}")
+            data = api_get(page, path, retries=5, fatal=False, bulk=True)
+            requests += 1
+            if data is None:
+                stopped = "Instagram rate limit"
+                break
+            users = data.get("users", [])
+            for u in users:
+                found[str(u["pk"])] = {"username": u["username"],
+                                       "full_name": u.get("full_name") or ""}
+            max_seen = max(max_seen, len(users))
+            # A page as large as the largest we've seen (and not tiny) may be capped.
+            capped = len(users) >= max_seen and max_seen >= SWEEP_CAP_MIN and not data.get("next_max_id")
+            if capped and len(prefix) < 3:
+                queue = [prefix + c for c in SWEEP_ALPHABET] + queue
+            print(f"\r  Sweep '{prefix}': {len(found)} {kind} total after {requests} searches "
+                  "(Ctrl-C to stop the sweep and keep what was found)   ", end="", flush=True)
+            time.sleep(random.uniform(1.5, 2.5))
+    except KeyboardInterrupt:
+        stopped = "interrupted"
     print()
+    if stopped:
+        print(f"  Sweep stopped early ({stopped}); keeping what was found. "
+              "Run --thorough again another day to continue filling in.")
 
 
 def take_snapshot(page: Page, user_id, username, full_name, rep_followers, rep_following,
