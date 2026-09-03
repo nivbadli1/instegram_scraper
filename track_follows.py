@@ -120,24 +120,30 @@ def api_get(page: Page, path: str, retries: int = 4, fatal: bool = True):
     url = IG_URL + path.lstrip("/")
     for attempt in range(1, retries + 1):
         res = page.evaluate(_FETCH_JS, [url, IG_APP_ID])
+        throttled = res["status"] == 429
         if res["status"] == 200:
             try:
-                return json.loads(res["text"])
+                data = json.loads(res["text"])
             except json.JSONDecodeError:
-                pass  # probably an HTML login/challenge page, retry below
+                data = None  # probably an HTML login/challenge page, retry below
+            if isinstance(data, dict) and data.get("status", "ok") == "ok":
+                return data
+            # 200 but {"status":"fail","message":"Please wait a few minutes"}
+            throttled = True
         if res["status"] == 404 and not fatal:
             return None
         if res["status"] in (401, 403) and not _is_logged_in(page.context):
             sys.exit("Instagram logged you out. Delete browser_profile/ and run again.")
         if attempt == retries:
             break
-        wait = 15 * attempt if res["status"] == 429 else 3 * attempt
-        print(f"  Instagram answered {res['status']}, retrying in {wait}s "
+        wait = 30 * (2 ** (attempt - 1)) if throttled else 3 * attempt
+        what = "rate limit" if throttled else f"status {res['status']}"
+        print(f"\n  Instagram {what}, waiting {wait}s before retry "
               f"({attempt}/{retries}) ...")
         time.sleep(wait)
     if fatal:
-        sys.exit(f"Giving up on {path}. Instagram may be rate limiting you; "
-                 "try again in an hour.")
+        sys.exit(f"Giving up on {path}. Instagram is rate limiting you; "
+                 "wait an hour and run again.")
     return None
 
 
@@ -196,27 +202,33 @@ def resolve_target(page: Page, target: str):
             sys.exit("Invalid choice.")
         print(f"Tip: set IG_TARGET={u['username']} in .env to skip this prompt next time.")
 
-    info = profile_info(page, u["username"])
-    rep = counts(info) if info else (None, None)
+    rep = (None, None)
+    info = api_get(page, f"api/v1/users/{u['pk']}/info/", retries=2, fatal=False)
+    try:
+        rep = (info["user"]["follower_count"], info["user"]["following_count"])
+    except (KeyError, TypeError):
+        print("  Could not read the profile counts (rate limited); continuing without them.")
     return (str(u["pk"]), u["username"], u.get("full_name") or "", *rep)
 
 
 def fetch_list(page: Page, user_id: str, kind: str, expected) -> dict:
     """kind is 'followers' or 'following'. Returns {user_id: {username, full_name}}.
 
-    Instagram's web endpoint sometimes stops handing out a next_max_id before
-    the list is really finished, so when that happens and we are still short
-    of the count shown on the profile, we keep going by numeric offset until a
-    page brings nothing new.
+    Instagram's web endpoint often stops handing out a next_max_id before the
+    list is really finished (and at a different point each run). So whenever
+    the cursor disappears we keep going by numeric offset, which the web
+    client itself also uses, until a page brings nothing new.
     """
     users: dict = {}
     max_id = ""
     offset_mode = False
+    empty_pages = 0
     while True:
-        path = f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
+        path = (f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
+                f"&search_surface=follow_list_page")
         if max_id:
             path += f"&max_id={quote(str(max_id))}"
-        data = api_get(page, path)
+        data = api_get(page, path, retries=5)
         before = len(users)
         for u in data.get("users", []):
             users[str(u["pk"])] = {"username": u["username"],
@@ -224,22 +236,26 @@ def fetch_list(page: Page, user_id: str, kind: str, expected) -> dict:
         print(f"\r  {len(users)} {kind} so far", end="", flush=True)
 
         got_new = len(users) > before
-        max_id = data.get("next_max_id")
-        if max_id and not offset_mode:
-            pass  # normal cursor pagination
-        elif expected and len(users) < expected and (got_new or not offset_mode):
-            # Cursor ran out early (or we are already paging by offset):
-            # continue from the number of users we have.
+        empty_pages = 0 if got_new else empty_pages + 1
+        cursor = data.get("next_max_id")
+        done = expected is not None and len(users) >= expected
+        if done or empty_pages >= 2:
+            break
+        if cursor and not offset_mode:
+            max_id = cursor
+        elif got_new:
             offset_mode = True
             max_id = str(len(users))
         else:
             break
-        time.sleep(random.uniform(1.0, 2.5))
+        time.sleep(random.uniform(1.5, 3.0))
     print()
-    if expected is not None and len(users) < expected:
+    if expected is None:
+        print(f"  (profile count unavailable, so cannot check whether {len(users)} is complete)")
+    elif len(users) < expected:
         print(f"  Note: profile shows {expected} {kind}, got {len(users)}. "
-              "The difference is usually deactivated or restricted accounts "
-              "that Instagram counts but does not list.")
+              "A small gap is deactivated or restricted accounts that Instagram "
+              "counts but does not list.")
     return users
 
 
