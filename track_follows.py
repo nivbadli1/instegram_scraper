@@ -361,7 +361,7 @@ def search_sweep(page: Page, user_id: str, kind: str, expected, found: dict) -> 
         capped = len(users) >= max_seen and max_seen >= SWEEP_CAP_MIN and not data.get("next_max_id")
         if capped and len(prefix) < 3:
             queue = [prefix + c for c in SWEEP_ALPHABET] + queue
-        print(f"\r  Sweep '{prefix}': {len(found)} {kind} total after {requests} searches",
+        print(f"\r  Sweep '{prefix}': {len(found)} {kind} total after {requests} searches   ",
               end="", flush=True)
         time.sleep(random.uniform(1.0, 2.0))
     print()
