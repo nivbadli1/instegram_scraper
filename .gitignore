@@ -1,4 +1,5 @@
 .env
+browser_profile/
 session.json
 data/
 __pycache__/

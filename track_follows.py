@@ -1,44 +1,47 @@
 #!/usr/bin/env python3
 """
-Instagram follower / following tracker.
+Instagram follower / following tracker (browser based).
 
-Logs into your Instagram account, resolves a target user (by username or by
-display name such as "neta tuvian"), saves a snapshot of everyone the target
-follows and everyone who follows them, and reports what changed since the
-previous snapshot.
+Opens a real Chromium window with Playwright. The first time, you log in to
+Instagram yourself in that window (password, Facebook login, 2FA - anything
+works). The login is kept in ./browser_profile so later runs don't ask again.
 
-Run it once to create the baseline, then re-run whenever you want to see
-new / removed followers and follows.
+Then the script resolves the target user (username or display name such as
+"neta tuvian"), downloads everyone they follow and everyone who follows them
+through Instagram's own web API, saves a snapshot, and prints what changed
+since the previous snapshot.
 
 Usage:
-    python track_follows.py                 # uses IG_TARGET from .env
+    python track_follows.py                       # target from IG_TARGET or default
     python track_follows.py --target neta.tuvian
     python track_follows.py --target "neta tuvian"
+    python track_follows.py --headed              # always show the browser
 """
 
 import argparse
 import json
 import os
+import random
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from dotenv import load_dotenv
-from instagrapi import Client
-from instagrapi.exceptions import (
-    ChallengeRequired,
-    LoginRequired,
-    TwoFactorRequired,
-    UserNotFound,
-)
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-SESSION_FILE = BASE_DIR / "session.json"
+PROFILE_DIR = BASE_DIR / "browser_profile"
+IG_URL = "https://www.instagram.com/"
+IG_APP_ID = "936619743392459"  # public app id the Instagram web client sends
+PAGE_SIZE = 50
+LOGIN_TIMEOUT_S = 600  # how long to wait for you to log in manually
 
 
 # --------------------------------------------------------------------------- #
-# Login
+# Browser / login
 # --------------------------------------------------------------------------- #
 def _prompt(msg: str) -> str:
     try:
@@ -48,50 +51,91 @@ def _prompt(msg: str) -> str:
                  "Run this script from a terminal.")
 
 
-def build_client(username: str, password: str) -> Client:
-    cl = Client()
-    cl.delay_range = [1, 3]  # small random delay between requests, be gentle
-    cl.challenge_code_handler = lambda user, choice: _prompt(
-        f"Instagram sent a verification code via {choice}. Enter it: "
+def _is_logged_in(context: BrowserContext) -> bool:
+    return any(c["name"] == "ds_user_id" and c["value"]
+               for c in context.cookies(IG_URL))
+
+
+def _launch(pw, headed: bool) -> BrowserContext:
+    return pw.chromium.launch_persistent_context(
+        str(PROFILE_DIR),
+        headless=not headed,
+        viewport={"width": 1280, "height": 900},
+        locale="en-US",
+        args=["--disable-blink-features=AutomationControlled"],
     )
 
-    # Re-use a saved session when possible so we don't log in every run.
-    if SESSION_FILE.exists():
-        try:
-            cl.load_settings(SESSION_FILE)
-            cl.login(username, password)
-            cl.get_timeline_feed()  # cheap call that fails if session is stale
-            print("Logged in using saved session.")
-            return cl
-        except (LoginRequired, ChallengeRequired, Exception) as exc:  # noqa: BLE001
-            print(f"Saved session is no longer valid ({exc.__class__.__name__}), "
-                  "logging in again.")
-            cl = Client()
-            cl.delay_range = [1, 3]
-            cl.challenge_code_handler = lambda user, choice: _prompt(
-                f"Instagram sent a verification code via {choice}. Enter it: "
-            )
 
-    try:
-        cl.login(username, password)
-    except TwoFactorRequired:
-        code = os.getenv("IG_2FA_CODE") or _prompt("Enter your 2FA code: ")
-        cl.login(username, password, verification_code=code)
+def open_instagram(pw, headed: bool):
+    """Return (context, page) with a logged-in Instagram tab."""
+    context = _launch(pw, headed)
+    if _is_logged_in(context):
+        page = context.new_page()
+        page.goto(IG_URL, wait_until="domcontentloaded")
+        print("Using saved Instagram login from browser_profile/.")
+        return context, page
 
-    cl.dump_settings(SESSION_FILE)
-    print("Logged in and saved session to session.json.")
-    return cl
+    # Not logged in: make sure the window is visible so you can log in.
+    if not headed:
+        context.close()
+        context = _launch(pw, headed=True)
+    page = context.new_page()
+    page.goto(IG_URL + "accounts/login/", wait_until="domcontentloaded")
+    print("\nA browser window is open. Log in to Instagram there "
+          "(Facebook login / 2FA are fine).")
+    print("Waiting for you to finish ...")
+    deadline = time.time() + LOGIN_TIMEOUT_S
+    while time.time() < deadline:
+        if _is_logged_in(context):
+            time.sleep(2)  # let Instagram finish setting cookies
+            print("Login detected, session saved to browser_profile/.")
+            page.goto(IG_URL, wait_until="domcontentloaded")
+            return context, page
+        time.sleep(1)
+    sys.exit("Timed out waiting for login.")
 
 
 # --------------------------------------------------------------------------- #
-# Target resolution
+# Instagram web API helpers (run inside the logged-in page)
 # --------------------------------------------------------------------------- #
-def resolve_target(cl: Client, target: str):
-    """Return (user_id, username, full_name) for the requested target."""
+_FETCH_JS = """
+async ([url, appId]) => {
+    try {
+        const r = await fetch(url, {
+            headers: {"x-ig-app-id": appId, "x-requested-with": "XMLHttpRequest"},
+            credentials: "include",
+        });
+        return {status: r.status, text: await r.text()};
+    } catch (e) {
+        return {status: 0, text: String(e)};  // network error, caller retries
+    }
+}
+"""
+
+
+def api_get(page: Page, path: str, retries: int = 4) -> dict:
+    url = IG_URL + path.lstrip("/")
+    for attempt in range(1, retries + 1):
+        res = page.evaluate(_FETCH_JS, [url, IG_APP_ID])
+        if res["status"] == 200:
+            try:
+                return json.loads(res["text"])
+            except json.JSONDecodeError:
+                pass  # probably an HTML login/challenge page, retry below
+        if res["status"] in (401, 403) and not _is_logged_in(page.context):
+            sys.exit("Instagram logged you out. Delete browser_profile/ and run again.")
+        wait = 15 * attempt if res["status"] == 429 else 3 * attempt
+        print(f"  Instagram answered {res['status']}, retrying in {wait}s "
+              f"({attempt}/{retries}) ...")
+        time.sleep(wait)
+    sys.exit(f"Giving up on {path}. Instagram may be rate limiting you; "
+             "try again in an hour.")
+
+
+def resolve_target(page: Page, target: str):
+    """Return (user_id, username, full_name)."""
     target = target.strip().lstrip("@")
 
-    # 1) Try treating the input as a username (also try common variants of a
-    #    display name like "neta tuvian" -> neta.tuvian / neta_tuvian / netatuvian).
     candidates = [target]
     if " " in target:
         parts = target.lower().split()
@@ -99,54 +143,66 @@ def resolve_target(cl: Client, target: str):
     for cand in candidates:
         if " " in cand:
             continue
-        try:
-            info = cl.user_info_by_username(cand)
-            return str(info.pk), info.username, info.full_name or ""
-        except UserNotFound:
-            continue
-        except Exception:  # noqa: BLE001
-            continue
+        res = page.evaluate(
+            _FETCH_JS,
+            [f"{IG_URL}api/v1/users/web_profile_info/?username={quote(cand)}", IG_APP_ID],
+        )
+        if res["status"] == 200:
+            try:
+                u = json.loads(res["text"])["data"]["user"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                u = None
+            if u:
+                return str(u["id"]), u["username"], u.get("full_name") or ""
 
-    # 2) Fall back to Instagram search by display name.
-    results = cl.search_users(target)
-    if not results:
+    # Fall back to Instagram's search box.
+    data = api_get(page, f"api/v1/web/search/topsearch/?context=blended&query={quote(target)}")
+    users = [x["user"] for x in data.get("users", [])]
+    if not users:
         sys.exit(f"Could not find any Instagram user matching '{target}'.")
 
-    exact = [u for u in results if (u.full_name or "").strip().lower() == target.lower()]
+    exact = [u for u in users if (u.get("full_name") or "").strip().lower() == target.lower()]
     if len(exact) == 1:
         u = exact[0]
-        return str(u.pk), u.username, u.full_name or ""
+        return str(u["pk"]), u["username"], u.get("full_name") or ""
 
     print(f"Several accounts match '{target}'. Pick one:")
-    for i, u in enumerate(results[:10], 1):
-        print(f"  {i}. @{u.username}  ({u.full_name})")
+    for i, u in enumerate(users[:10], 1):
+        print(f"  {i}. @{u['username']}  ({u.get('full_name', '')})")
     choice = _prompt("Number (or press Enter for 1): ") or "1"
     try:
-        u = results[int(choice) - 1]
+        u = users[int(choice) - 1]
     except (ValueError, IndexError):
         sys.exit("Invalid choice.")
-    print(f"Tip: set IG_TARGET={u.username} in .env to skip this prompt next time.")
-    return str(u.pk), u.username, u.full_name or ""
+    print(f"Tip: set IG_TARGET={u['username']} in .env to skip this prompt next time.")
+    return str(u["pk"]), u["username"], u.get("full_name") or ""
 
 
-# --------------------------------------------------------------------------- #
-# Snapshot + diff
-# --------------------------------------------------------------------------- #
-def to_map(users) -> dict:
-    """{user_id: {username, full_name}} from instagrapi UserShort dicts."""
-    return {
-        str(pk): {"username": u.username, "full_name": u.full_name or ""}
-        for pk, u in users.items()
-    }
+def fetch_list(page: Page, user_id: str, kind: str) -> dict:
+    """kind is 'followers' or 'following'. Returns {user_id: {username, full_name}}."""
+    users, max_id = {}, ""
+    while True:
+        path = f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
+        if max_id:
+            path += f"&max_id={quote(max_id)}"
+        data = api_get(page, path)
+        for u in data.get("users", []):
+            users[str(u["pk"])] = {"username": u["username"],
+                                   "full_name": u.get("full_name") or ""}
+        print(f"\r  {len(users)} {kind} so far", end="", flush=True)
+        max_id = data.get("next_max_id")
+        if not max_id:
+            break
+        time.sleep(random.uniform(1.0, 2.5))
+    print()
+    return users
 
 
-def take_snapshot(cl: Client, user_id: str, username: str, full_name: str) -> dict:
+def take_snapshot(page: Page, user_id: str, username: str, full_name: str) -> dict:
     print(f"Fetching who @{username} follows ...")
-    following = to_map(cl.user_following(user_id, use_cache=False))
-    print(f"  {len(following)} following")
+    following = fetch_list(page, user_id, "following")
     print(f"Fetching who follows @{username} ...")
-    followers = to_map(cl.user_followers(user_id, use_cache=False))
-    print(f"  {len(followers)} followers")
+    followers = fetch_list(page, user_id, "followers")
     return {
         "taken_at": datetime.now().isoformat(timespec="seconds"),
         "target": {"user_id": user_id, "username": username, "full_name": full_name},
@@ -155,6 +211,9 @@ def take_snapshot(cl: Client, user_id: str, username: str, full_name: str) -> di
     }
 
 
+# --------------------------------------------------------------------------- #
+# Diff / report
+# --------------------------------------------------------------------------- #
 def diff_lists(old: dict, new: dict):
     added = {k: new[k] for k in new.keys() - old.keys()}
     removed = {k: old[k] for k in old.keys() - new.keys()}
@@ -211,28 +270,8 @@ def report(prev: dict, curr: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def main():
-    load_dotenv(BASE_DIR / ".env")
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--target", default=os.getenv("IG_TARGET", "neta tuvian"),
-                        help="Instagram username or display name to track")
-    args = parser.parse_args()
-
-    ig_user = os.getenv("IG_USERNAME")
-    ig_pass = os.getenv("IG_PASSWORD")
-    if not ig_user or not ig_pass:
-        sys.exit("Set IG_USERNAME and IG_PASSWORD in .env (see .env.example).")
-
-    cl = build_client(ig_user, ig_pass)
-    user_id, username, full_name = resolve_target(cl, args.target)
-    print(f"Tracking @{username} ({full_name}), id {user_id}")
-
-    curr = take_snapshot(cl, user_id, username, full_name)
-
+def save_and_compare(curr: dict) -> None:
+    username = curr["target"]["username"]
     target_dir = DATA_DIR / username
     target_dir.mkdir(parents=True, exist_ok=True)
     latest_file = target_dir / "latest.json"
@@ -246,10 +285,35 @@ def main():
     else:
         print("\nFirst run: baseline saved. Run again later to see changes.")
 
-    (target_dir / f"snapshot_{stamp}.json").write_text(
-        json.dumps(curr, indent=2, ensure_ascii=False), encoding="utf-8")
-    latest_file.write_text(json.dumps(curr, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nSnapshot saved to {target_dir.relative_to(BASE_DIR)}/")
+    dump = json.dumps(curr, indent=2, ensure_ascii=False)
+    (target_dir / f"snapshot_{stamp}.json").write_text(dump, encoding="utf-8")
+    latest_file.write_text(dump, encoding="utf-8")
+    print(f"\nSnapshot saved to {os.path.relpath(target_dir, BASE_DIR)}/")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    load_dotenv(BASE_DIR / ".env")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--target", default=os.getenv("IG_TARGET", "neta tuvian"),
+                        help="Instagram username or display name to track")
+    parser.add_argument("--headed", action="store_true",
+                        help="show the browser window even when already logged in")
+    args = parser.parse_args()
+
+    with sync_playwright() as pw:
+        context, page = open_instagram(pw, headed=args.headed)
+        try:
+            user_id, username, full_name = resolve_target(page, args.target)
+            print(f"Tracking @{username} ({full_name}), id {user_id}")
+            curr = take_snapshot(page, user_id, username, full_name)
+        finally:
+            context.close()
+
+    save_and_compare(curr)
 
 
 if __name__ == "__main__":
