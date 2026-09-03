@@ -38,7 +38,7 @@ IG_URL = "https://www.instagram.com/"
 IG_APP_ID = "936619743392459"  # public app id the Instagram web client sends
 PAGE_SIZE = 25
 LOGIN_TIMEOUT_S = 600  # how long to wait for you to log in manually
-MAX_VERIFY = 200       # max individual "is this person still there?" checks per run
+MAX_VERIFY = 300       # max individual "is this person still there?" checks per run
 
 
 # --------------------------------------------------------------------------- #
@@ -265,32 +265,49 @@ def verify_still_present(page: Page, user_id: str, kind: str, candidates: dict):
     search box about each one. Returns (still_present, gone, unverified)."""
     still, gone, unverified = {}, {}, {}
     items = list(candidates.items())
-    for i, (uid, u) in enumerate(items, 1):
-        if i > MAX_VERIFY:
-            unverified[uid] = u
-            continue
-        print(f"\r  Verifying {kind} not seen this run: {i}/{min(len(items), MAX_VERIFY)}",
-              end="", flush=True)
-        path = (f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
-                f"&search_surface=follow_list_page&query={quote(u['username'])}")
-        data = api_get(page, path, retries=5, fatal=False)
-        if data is None:
-            unverified[uid] = u
-            continue
-        hit = next((x for x in data.get("users", []) if str(x["pk"]) == uid), None)
-        if hit:
-            still[uid] = {"username": hit["username"], "full_name": hit.get("full_name") or ""}
-        else:
-            gone[uid] = u
-        time.sleep(random.uniform(1.0, 2.0))
+    total = min(len(items), MAX_VERIFY)
+    try:
+        for i, (uid, u) in enumerate(items, 1):
+            if i > MAX_VERIFY:
+                unverified[uid] = u
+                continue
+            print(f"\r  Verifying {kind} not seen this run: {i}/{total} "
+                  "(Ctrl-C to skip the rest and save)", end="", flush=True)
+            path = (f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
+                    f"&search_surface=follow_list_page&query={quote(u['username'])}")
+            data = api_get(page, path, retries=5, fatal=False)
+            if data is None:
+                unverified[uid] = u
+                continue
+            hit = next((x for x in data.get("users", []) if str(x["pk"]) == uid), None)
+            if not hit:  # the list search misses sometimes; try once more
+                time.sleep(random.uniform(2.0, 3.0))
+                data = api_get(page, path, retries=3, fatal=False) or {}
+                hit = next((x for x in data.get("users", []) if str(x["pk"]) == uid), None)
+            if hit:
+                still[uid] = {"username": hit["username"], "full_name": hit.get("full_name") or ""}
+            else:
+                gone[uid] = u
+            time.sleep(random.uniform(1.0, 2.0))
+    except KeyboardInterrupt:
+        checked = set(still) | set(gone) | set(unverified)
+        for uid, u in items:
+            if uid not in checked:
+                unverified[uid] = u
+        print("\n  Interrupted: remaining people kept as unverified, saving what we have.")
     if items:
         print()
     return still, gone, unverified
 
 
-def reconcile(page: Page, prev: dict, curr: dict) -> None:
+def reconcile(page: Page, prev: dict, curr: dict) -> dict:
     """Merge people from the previous snapshot who were not fetched this run
-    but are confirmed still present, so the list converges to the truth."""
+    but are confirmed still present, so the list converges to the truth.
+
+    Someone the search cannot find is only reported as lost once that has
+    happened on two consecutive runs; until then they stay in the snapshot
+    with a 'missing_since' mark. Returns the people in that pending state."""
+    pending = {"followers": {}, "following": {}}
     for kind in ("following", "followers"):
         missing = {k: v for k, v in prev[kind].items() if k not in curr[kind]}
         if not missing:
@@ -298,10 +315,19 @@ def reconcile(page: Page, prev: dict, curr: dict) -> None:
         still, gone, unverified = verify_still_present(page, curr["target"]["user_id"], kind, missing)
         curr[kind].update(still)
         curr[kind].update(unverified)  # assume present until we can check
-        msg = f"  {kind}: {len(missing)} missing from this fetch, {len(still)} confirmed still there, {len(gone)} confirmed gone"
+        confirmed = 0
+        for uid, u in gone.items():
+            if u.get("missing_since"):
+                confirmed += 1  # missing two runs in a row: really gone, drop it
+            else:
+                curr[kind][uid] = {**u, "missing_since": curr["taken_at"]}
+                pending[kind][uid] = u
+        msg = (f"  {kind}: {len(missing)} missing from this fetch, {len(still)} confirmed still there, "
+               f"{len(pending[kind])} not found (will confirm next run), {confirmed} confirmed gone")
         if unverified:
             msg += f", {len(unverified)} left unverified (kept, checked next run)"
         print(msg)
+    return pending
 
 
 def take_snapshot(page: Page, user_id, username, full_name, rep_followers, rep_following) -> dict:
@@ -424,7 +450,9 @@ def write_csvs(target_dir: Path, stamp: str, curr: dict, changes) -> None:
         for key, label in (("new_followers", "new_follower"),
                             ("lost_followers", "lost_follower"),
                             ("new_following", "started_following"),
-                            ("unfollowed", "unfollowed")):
+                            ("unfollowed", "unfollowed"),
+                            ("possibly_lost_followers", "possibly_lost_follower"),
+                            ("possibly_unfollowed", "possibly_unfollowed")):
             for uid, u in changes[key].items():
                 rows.append([taken, label, uid, u["username"], u["full_name"]])
         for uid, r in changes["username_changes"].items():
@@ -434,7 +462,7 @@ def write_csvs(target_dir: Path, stamp: str, curr: dict, changes) -> None:
                         ["taken_at", "change", "user_id", "username", "full_name"], rows)
 
 
-def save_and_compare(curr: dict) -> None:
+def save_and_compare(curr: dict, pending: dict = None) -> None:
     username = curr["target"]["username"]
     target_dir = DATA_DIR / username
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +477,13 @@ def save_and_compare(curr: dict) -> None:
     if latest_file.exists():
         prev = json.loads(latest_file.read_text(encoding="utf-8"))
         changes = report(prev, curr)
+        pending = pending or {"followers": {}, "following": {}}
+        changes["possibly_lost_followers"] = pending["followers"]
+        changes["possibly_unfollowed"] = pending["following"]
+        if pending["followers"] or pending["following"]:
+            print("\nNot found this run, will be reported as lost if still missing next run:")
+            print(f"  Followers ({len(pending['followers'])}):\n{fmt(pending['followers'])}")
+            print(f"  Following ({len(pending['following'])}):\n{fmt(pending['following'])}")
         (target_dir / f"changes_{stamp}.json").write_text(
             json.dumps(changes, indent=2, ensure_ascii=False), encoding="utf-8")
     else:
@@ -485,14 +520,15 @@ def main():
             shown = f" ({rep_flw} followers, {rep_fng} following on profile)" if rep_flw else ""
             print(f"Tracking @{username} ({full_name}), id {user_id}{shown}")
             curr = take_snapshot(page, user_id, username, full_name, rep_flw, rep_fng)
+            pending = None
             latest_file = DATA_DIR / username / "latest.json"
             if latest_file.exists():
                 prev = json.loads(latest_file.read_text(encoding="utf-8"))
-                reconcile(page, prev, curr)
+                pending = reconcile(page, prev, curr)
         finally:
             context.close()
 
-    save_and_compare(curr)
+    save_and_compare(curr, pending)
 
 
 if __name__ == "__main__":

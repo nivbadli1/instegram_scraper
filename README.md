@@ -46,14 +46,17 @@ restricted accounts that Instagram counts but never lists.)
 To keep the change report accurate anyway, the script does two things:
 
 - Anyone who was in the previous snapshot but did not show up in this run's
-  fetch is checked individually through the list's own search box. Only
-  people confirmed absent are reported as lost / unfollowed.
-- People confirmed still present are kept in the snapshot, so the saved list
-  fills in toward the true total over a few runs.
+  fetch is checked individually through the list's own search box. People
+  confirmed still present are kept in the snapshot, so the saved list fills
+  in toward the true total over a few runs.
+- That search misses a few percent of people who are actually there, so a
+  person is reported as lost / unfollowed only after being missing on two
+  consecutive runs. In between they are listed under "possibly lost" (and
+  logged in `changes.csv` as `possibly_lost_follower` / `possibly_unfollowed`).
 
 The first run after an incomplete baseline will therefore report a burst of
-"new" people that are really just ones the baseline missed. From the second
-comparison on, the report is reliable.
+"new" people that are really just ones the baseline missed. From the third
+run on, the report is reliable.
 
 Options:
 
@@ -80,7 +83,7 @@ started_following, unfollowed`.
 
 `changes.csv` columns: `taken_at, change, user_id, username, full_name` where
 `change` is one of `new_follower`, `lost_follower`, `started_following`,
-`unfollowed`, `username_change`.
+`unfollowed`, `username_change`, `possibly_lost_follower`, `possibly_unfollowed`.
 
 `.env`, `browser_profile/` and `data/` are git-ignored; they contain your
 session and personal data.
