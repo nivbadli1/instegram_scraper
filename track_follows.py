@@ -6,19 +6,19 @@ Opens a real Chromium window with Playwright. The first time, you log in to
 Instagram yourself in that window (password, Facebook login, 2FA - anything
 works). The login is kept in ./browser_profile so later runs don't ask again.
 
-Then the script resolves the target user (username or display name such as
-"neta tuvian"), downloads everyone they follow and everyone who follows them
-through Instagram's own web API, saves a snapshot, and prints what changed
-since the previous snapshot.
+Then the script resolves the target user (set IG_TARGET in .env, or pass
+--target), downloads everyone they follow and everyone who follows them
+through Instagram's own web API, saves a versioned snapshot (JSON + CSV), and
+prints / logs what changed since the previous snapshot.
 
 Usage:
-    python track_follows.py                       # target from IG_TARGET or default
-    python track_follows.py --target neta.tuvian
-    python track_follows.py --target "neta tuvian"
+    python track_follows.py                       # target from IG_TARGET in .env
+    python track_follows.py --target neta_tuvian
     python track_follows.py --headed              # always show the browser
 """
 
 import argparse
+import csv
 import json
 import os
 import random
@@ -36,7 +36,7 @@ DATA_DIR = BASE_DIR / "data"
 PROFILE_DIR = BASE_DIR / "browser_profile"
 IG_URL = "https://www.instagram.com/"
 IG_APP_ID = "936619743392459"  # public app id the Instagram web client sends
-PAGE_SIZE = 50
+PAGE_SIZE = 25
 LOGIN_TIMEOUT_S = 600  # how long to wait for you to log in manually
 
 
@@ -87,9 +87,10 @@ def open_instagram(pw, headed: bool):
     deadline = time.time() + LOGIN_TIMEOUT_S
     while time.time() < deadline:
         if _is_logged_in(context):
-            time.sleep(2)  # let Instagram finish setting cookies
+            time.sleep(3)  # let Instagram finish setting cookies
             print("Login detected, session saved to browser_profile/.")
             page.goto(IG_URL, wait_until="domcontentloaded")
+            time.sleep(2)
             return context, page
         time.sleep(1)
     sys.exit("Timed out waiting for login.")
@@ -113,7 +114,9 @@ async ([url, appId]) => {
 """
 
 
-def api_get(page: Page, path: str, retries: int = 4) -> dict:
+def api_get(page: Page, path: str, retries: int = 4, fatal: bool = True):
+    """GET an Instagram web API path. Returns parsed JSON, or None if not
+    fatal and every attempt failed."""
     url = IG_URL + path.lstrip("/")
     for attempt in range(1, retries + 1):
         res = page.evaluate(_FETCH_JS, [url, IG_APP_ID])
@@ -122,20 +125,43 @@ def api_get(page: Page, path: str, retries: int = 4) -> dict:
                 return json.loads(res["text"])
             except json.JSONDecodeError:
                 pass  # probably an HTML login/challenge page, retry below
+        if res["status"] == 404 and not fatal:
+            return None
         if res["status"] in (401, 403) and not _is_logged_in(page.context):
             sys.exit("Instagram logged you out. Delete browser_profile/ and run again.")
+        if attempt == retries:
+            break
         wait = 15 * attempt if res["status"] == 429 else 3 * attempt
         print(f"  Instagram answered {res['status']}, retrying in {wait}s "
               f"({attempt}/{retries}) ...")
         time.sleep(wait)
-    sys.exit(f"Giving up on {path}. Instagram may be rate limiting you; "
-             "try again in an hour.")
+    if fatal:
+        sys.exit(f"Giving up on {path}. Instagram may be rate limiting you; "
+                 "try again in an hour.")
+    return None
+
+
+def profile_info(page: Page, username: str):
+    """Return the profile dict from web_profile_info, or None."""
+    data = api_get(page, f"api/v1/users/web_profile_info/?username={quote(username)}",
+                   retries=2, fatal=False)
+    try:
+        return data["data"]["user"] or None
+    except (KeyError, TypeError):
+        return None
 
 
 def resolve_target(page: Page, target: str):
-    """Return (user_id, username, full_name)."""
+    """Return (user_id, username, full_name, reported_followers, reported_following)."""
     target = target.strip().lstrip("@")
 
+    def counts(u):
+        try:
+            return (u["edge_followed_by"]["count"], u["edge_follow"]["count"])
+        except (KeyError, TypeError):
+            return (None, None)
+
+    # 1) Treat the input as a username (plus variants of a display name).
     candidates = [target]
     if " " in target:
         parts = target.lower().split()
@@ -143,69 +169,90 @@ def resolve_target(page: Page, target: str):
     for cand in candidates:
         if " " in cand:
             continue
-        res = page.evaluate(
-            _FETCH_JS,
-            [f"{IG_URL}api/v1/users/web_profile_info/?username={quote(cand)}", IG_APP_ID],
-        )
-        if res["status"] == 200:
-            try:
-                u = json.loads(res["text"])["data"]["user"]
-            except (json.JSONDecodeError, KeyError, TypeError):
-                u = None
-            if u:
-                return str(u["id"]), u["username"], u.get("full_name") or ""
+        u = profile_info(page, cand)
+        if u:
+            return (str(u["id"]), u["username"], u.get("full_name") or "", *counts(u))
 
-    # Fall back to Instagram's search box.
+    # 2) Fall back to Instagram's search box.
     data = api_get(page, f"api/v1/web/search/topsearch/?context=blended&query={quote(target)}")
     users = [x["user"] for x in data.get("users", [])]
     if not users:
         sys.exit(f"Could not find any Instagram user matching '{target}'.")
 
-    exact = [u for u in users if (u.get("full_name") or "").strip().lower() == target.lower()]
-    if len(exact) == 1:
-        u = exact[0]
-        return str(u["pk"]), u["username"], u.get("full_name") or ""
+    exact_user = [u for u in users if u["username"].lower() == target.lower()]
+    exact_name = [u for u in users if (u.get("full_name") or "").strip().lower() == target.lower()]
+    if exact_user:
+        u = exact_user[0]
+    elif len(exact_name) == 1:
+        u = exact_name[0]
+    else:
+        print(f"Several accounts match '{target}'. Pick one:")
+        for i, u in enumerate(users[:10], 1):
+            print(f"  {i}. @{u['username']}  ({u.get('full_name', '')})")
+        choice = _prompt("Number (or press Enter for 1): ") or "1"
+        try:
+            u = users[int(choice) - 1]
+        except (ValueError, IndexError):
+            sys.exit("Invalid choice.")
+        print(f"Tip: set IG_TARGET={u['username']} in .env to skip this prompt next time.")
 
-    print(f"Several accounts match '{target}'. Pick one:")
-    for i, u in enumerate(users[:10], 1):
-        print(f"  {i}. @{u['username']}  ({u.get('full_name', '')})")
-    choice = _prompt("Number (or press Enter for 1): ") or "1"
-    try:
-        u = users[int(choice) - 1]
-    except (ValueError, IndexError):
-        sys.exit("Invalid choice.")
-    print(f"Tip: set IG_TARGET={u['username']} in .env to skip this prompt next time.")
-    return str(u["pk"]), u["username"], u.get("full_name") or ""
+    info = profile_info(page, u["username"])
+    rep = counts(info) if info else (None, None)
+    return (str(u["pk"]), u["username"], u.get("full_name") or "", *rep)
 
 
-def fetch_list(page: Page, user_id: str, kind: str) -> dict:
-    """kind is 'followers' or 'following'. Returns {user_id: {username, full_name}}."""
-    users, max_id = {}, ""
+def fetch_list(page: Page, user_id: str, kind: str, expected) -> dict:
+    """kind is 'followers' or 'following'. Returns {user_id: {username, full_name}}.
+
+    Instagram's web endpoint sometimes stops handing out a next_max_id before
+    the list is really finished, so when that happens and we are still short
+    of the count shown on the profile, we keep going by numeric offset until a
+    page brings nothing new.
+    """
+    users: dict = {}
+    max_id = ""
+    offset_mode = False
     while True:
         path = f"api/v1/friendships/{user_id}/{kind}/?count={PAGE_SIZE}"
         if max_id:
-            path += f"&max_id={quote(max_id)}"
+            path += f"&max_id={quote(str(max_id))}"
         data = api_get(page, path)
+        before = len(users)
         for u in data.get("users", []):
             users[str(u["pk"])] = {"username": u["username"],
                                    "full_name": u.get("full_name") or ""}
         print(f"\r  {len(users)} {kind} so far", end="", flush=True)
+
+        got_new = len(users) > before
         max_id = data.get("next_max_id")
-        if not max_id:
+        if max_id and not offset_mode:
+            pass  # normal cursor pagination
+        elif expected and len(users) < expected and (got_new or not offset_mode):
+            # Cursor ran out early (or we are already paging by offset):
+            # continue from the number of users we have.
+            offset_mode = True
+            max_id = str(len(users))
+        else:
             break
         time.sleep(random.uniform(1.0, 2.5))
     print()
+    if expected is not None and len(users) < expected:
+        print(f"  Note: profile shows {expected} {kind}, got {len(users)}. "
+              "The difference is usually deactivated or restricted accounts "
+              "that Instagram counts but does not list.")
     return users
 
 
-def take_snapshot(page: Page, user_id: str, username: str, full_name: str) -> dict:
+def take_snapshot(page: Page, user_id, username, full_name, rep_followers, rep_following) -> dict:
     print(f"Fetching who @{username} follows ...")
-    following = fetch_list(page, user_id, "following")
+    following = fetch_list(page, user_id, "following", rep_following)
     print(f"Fetching who follows @{username} ...")
-    followers = fetch_list(page, user_id, "followers")
+    followers = fetch_list(page, user_id, "followers", rep_followers)
     return {
         "taken_at": datetime.now().isoformat(timespec="seconds"),
-        "target": {"user_id": user_id, "username": username, "full_name": full_name},
+        "target": {"user_id": user_id, "username": username, "full_name": full_name,
+                   "reported_followers": rep_followers,
+                   "reported_following": rep_following},
         "following": following,
         "followers": followers,
     }
@@ -270,13 +317,74 @@ def report(prev: dict, curr: dict) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# CSV output
+# --------------------------------------------------------------------------- #
+def _append_csv(path: Path, header: list, rows: list) -> None:
+    new_file = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(header)
+        w.writerows(rows)
+
+
+def write_csvs(target_dir: Path, stamp: str, curr: dict, changes) -> None:
+    taken = curr["taken_at"]
+    t = curr["target"]
+
+    # 1) One versioned CSV per run with the full lists.
+    rows = []
+    for kind in ("followers", "following"):
+        for uid, u in sorted(curr[kind].items(), key=lambda x: x[1]["username"].lower()):
+            rows.append([taken, kind, uid, u["username"], u["full_name"]])
+    with (target_dir / f"snapshot_{stamp}.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["taken_at", "relation", "user_id", "username", "full_name"])
+        w.writerows(rows)
+
+    # 2) One line per run with the totals (easy to chart over time).
+    _append_csv(
+        target_dir / "history.csv",
+        ["taken_at", "target", "followers", "following",
+         "reported_followers", "reported_following",
+         "new_followers", "lost_followers", "started_following", "unfollowed"],
+        [[taken, t["username"], len(curr["followers"]), len(curr["following"]),
+          t.get("reported_followers") or "", t.get("reported_following") or "",
+          len(changes["new_followers"]) if changes else 0,
+          len(changes["lost_followers"]) if changes else 0,
+          len(changes["new_following"]) if changes else 0,
+          len(changes["unfollowed"]) if changes else 0]],
+    )
+
+    # 3) Running log of every individual change across all runs.
+    if changes:
+        rows = []
+        for key, label in (("new_followers", "new_follower"),
+                            ("lost_followers", "lost_follower"),
+                            ("new_following", "started_following"),
+                            ("unfollowed", "unfollowed")):
+            for uid, u in changes[key].items():
+                rows.append([taken, label, uid, u["username"], u["full_name"]])
+        for uid, r in changes["username_changes"].items():
+            rows.append([taken, "username_change", uid, r["new"], f"was @{r['old']}"])
+        if rows:
+            _append_csv(target_dir / "changes.csv",
+                        ["taken_at", "change", "user_id", "username", "full_name"], rows)
+
+
 def save_and_compare(curr: dict) -> None:
     username = curr["target"]["username"]
     target_dir = DATA_DIR / username
     target_dir.mkdir(parents=True, exist_ok=True)
     latest_file = target_dir / "latest.json"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    n = 1
+    while (target_dir / f"snapshot_{stamp}.json").exists():  # never overwrite a run
+        n += 1
+        stamp = f"{stamp.split('_v')[0]}_v{n}"
 
+    changes = None
     if latest_file.exists():
         prev = json.loads(latest_file.read_text(encoding="utf-8"))
         changes = report(prev, curr)
@@ -288,7 +396,10 @@ def save_and_compare(curr: dict) -> None:
     dump = json.dumps(curr, indent=2, ensure_ascii=False)
     (target_dir / f"snapshot_{stamp}.json").write_text(dump, encoding="utf-8")
     latest_file.write_text(dump, encoding="utf-8")
-    print(f"\nSnapshot saved to {os.path.relpath(target_dir, BASE_DIR)}/")
+    write_csvs(target_dir, stamp, curr, changes)
+    rel = os.path.relpath(target_dir, BASE_DIR)
+    print(f"\nSaved to {rel}/: snapshot_{stamp}.csv, history.csv"
+          + (", changes.csv" if changes else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -298,18 +409,21 @@ def main():
     load_dotenv(BASE_DIR / ".env")
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--target", default=os.getenv("IG_TARGET", "neta tuvian"),
-                        help="Instagram username or display name to track")
+    parser.add_argument("--target", default=os.getenv("IG_TARGET"),
+                        help="Instagram username to track (default: IG_TARGET from .env)")
     parser.add_argument("--headed", action="store_true",
                         help="show the browser window even when already logged in")
     args = parser.parse_args()
+    if not args.target:
+        sys.exit("No target given. Set IG_TARGET=<username> in .env or pass --target.")
 
     with sync_playwright() as pw:
         context, page = open_instagram(pw, headed=args.headed)
         try:
-            user_id, username, full_name = resolve_target(page, args.target)
-            print(f"Tracking @{username} ({full_name}), id {user_id}")
-            curr = take_snapshot(page, user_id, username, full_name)
+            user_id, username, full_name, rep_flw, rep_fng = resolve_target(page, args.target)
+            shown = f" ({rep_flw} followers, {rep_fng} following on profile)" if rep_flw else ""
+            print(f"Tracking @{username} ({full_name}), id {user_id}{shown}")
+            curr = take_snapshot(page, user_id, username, full_name, rep_flw, rep_fng)
         finally:
             context.close()
 

@@ -14,9 +14,13 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Optionally create `.env` from `.env.example` and set `IG_TARGET` to the
-account you want to track, either the username (e.g. `neta.tuvian`) or the
-display name (`neta tuvian`). Using the exact username is more reliable.
+Create `.env` from `.env.example` and set `IG_TARGET` to the username of the
+account you want to track:
+
+```bash
+cp .env.example .env
+# edit .env -> IG_TARGET=neta_tuvian
+```
 
 ## Run
 
@@ -32,10 +36,14 @@ python track_follows.py
   started following, unfollowed, username changes) and saves both the new
   snapshot and the change report.
 
+The script also reads the follower / following counts shown on the profile
+and tells you if the downloaded lists are shorter. A small gap is normal:
+Instagram counts deactivated and restricted accounts that it never lists.
+
 Options:
 
 ```bash
-python track_follows.py --target neta.tuvian   # track a different account this run
+python track_follows.py --target other_user   # track a different account this run
 python track_follows.py --headed               # show the browser window
 ```
 
@@ -45,8 +53,19 @@ python track_follows.py --headed               # show the browser window
 |------|---------|
 | `browser_profile/` | Chromium profile holding your Instagram login |
 | `data/<username>/latest.json` | Most recent snapshot, used as the comparison baseline |
-| `data/<username>/snapshot_<timestamp>.json` | History of every snapshot |
-| `data/<username>/changes_<timestamp>.json` | Change report of every run after the first |
+| `data/<username>/snapshot_<timestamp>.csv` | Full followers + following list of that run (one file per run) |
+| `data/<username>/history.csv` | One row per run: totals, profile counts, and how many changed |
+| `data/<username>/changes.csv` | Running log of every individual change across all runs |
+| `data/<username>/snapshot_<timestamp>.json` | Same snapshot as JSON |
+| `data/<username>/changes_<timestamp>.json` | Change report of that run as JSON |
+
+`history.csv` columns: `taken_at, target, followers, following,
+reported_followers, reported_following, new_followers, lost_followers,
+started_following, unfollowed`.
+
+`changes.csv` columns: `taken_at, change, user_id, username, full_name` where
+`change` is one of `new_follower`, `lost_follower`, `started_following`,
+`unfollowed`, `username_change`.
 
 `.env`, `browser_profile/` and `data/` are git-ignored; they contain your
 session and personal data.
