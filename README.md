@@ -71,11 +71,11 @@ python track_follows.py --headed               # show the browser window
 The normal fetch returns only part of each list (see below). `--thorough`
 additionally sweeps the list's search box for every username prefix
 (`a`, `b`, ... `9`, `.`, `_`), drilling into longer prefixes when a page is
-full, and unions everything it finds. That is a few hundred requests and
-takes 5 to 15 minutes, but it gets the lists to (or within a handful of
-deactivated accounts of) the counts shown on the profile.
+full, and unions everything it finds. Each run adds up to 240 searches, so it
+takes two or three thorough runs on different days to reach (or get within a
+handful of deactivated accounts of) the counts shown on the profile.
 
-Each thorough run is capped at 450 searches per list and stops early if
+Each thorough run is capped at 120 searches per list and stops early if
 Instagram starts refusing requests, keeping everything found so far. The
 sweep starts from a different letter each time, so if one run is cut short
 the next `--thorough` run fills in the rest. Ctrl-C during the sweep or the
@@ -112,8 +112,12 @@ session and personal data.
 
 - The target account must be visible to your account (public, or private and
   you follow it).
-- Instagram rate-limits aggressively. Once or twice a day is safe; several
-  runs within an hour will get you throttled (the script waits and retries,
-  but it gets slow). Large accounts take a while.
+- **Run it at most once a day.** Instagram locks accounts it thinks are
+  automated. A plain run is a few hundred small requests; `--thorough` adds
+  up to 240 more. Several runs in one day, or repeated `--thorough` runs,
+  have led to a temporary account lock. If that happens, confirm your
+  identity in the Instagram app and do not run the script for 48 hours.
+- Consider using a separate Instagram account for tracking rather than your
+  main one. It only needs to be able to see the target's followers list.
 - If Instagram logs you out or asks you to confirm the login, delete
   `browser_profile/` and run again to log in fresh.

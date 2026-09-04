@@ -38,7 +38,7 @@ IG_URL = "https://www.instagram.com/"
 IG_APP_ID = "936619743392459"  # public app id the Instagram web client sends
 PAGE_SIZE = 25
 LOGIN_TIMEOUT_S = 600  # how long to wait for you to log in manually
-MAX_VERIFY = 300       # max individual "is this person still there?" checks per run
+MAX_VERIFY = 100       # max individual "is this person still there?" checks per run
 
 
 # --------------------------------------------------------------------------- #
@@ -288,7 +288,7 @@ def fetch_list(page: Page, user_id: str, kind: str, expected) -> dict:
             max_id = str(len(users))
         else:
             break
-        time.sleep(random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(2.5, 4.5))
     print()
     if expected is None:
         print(f"  (profile count unavailable, so cannot check whether {len(users)} is complete)")
@@ -327,7 +327,7 @@ def verify_still_present(page: Page, user_id: str, kind: str, candidates: dict):
                 still[uid] = {"username": hit["username"], "full_name": hit.get("full_name") or ""}
             else:
                 gone[uid] = u
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(2.5, 4.0))
     except KeyboardInterrupt:
         checked = set(still) | set(gone) | set(unverified)
         for uid, u in items:
@@ -372,7 +372,7 @@ def reconcile(page: Page, prev: dict, curr: dict) -> dict:
 # Username characters, most common first so the page-size cap is learned early.
 SWEEP_ALPHABET = "asmlejdnrtkbcgiohyfpvzwuxq0123456789._"
 SWEEP_COUNT = 50
-SWEEP_MAX_REQUESTS = 450  # per list per run; more than this in one go gets you throttled
+SWEEP_MAX_REQUESTS = 120  # per list per run; ~450 in one sitting got an account locked
 SWEEP_CAP_MIN = 20  # a page must be at least this big to be considered "capped"
 
 
@@ -414,7 +414,7 @@ def search_sweep(page: Page, user_id: str, kind: str, expected, found: dict) -> 
                 queue = [prefix + c for c in SWEEP_ALPHABET] + queue
             print(f"\r  Sweep '{prefix}': {len(found)} {kind} total after {requests} searches "
                   "(Ctrl-C to stop the sweep and keep what was found)   ", end="", flush=True)
-            time.sleep(random.uniform(1.5, 2.5))
+            time.sleep(random.uniform(3.0, 5.0))
     except KeyboardInterrupt:
         stopped = "interrupted"
     print()
