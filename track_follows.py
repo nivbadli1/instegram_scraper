@@ -74,6 +74,16 @@ def open_instagram(pw, headed: bool):
         page = context.new_page()
         page.goto(IG_URL, wait_until="domcontentloaded")
         print("Using saved Instagram login from browser_profile/.")
+        if headed:
+            time.sleep(3)
+            if "challenge" in page.url or "checkpoint" in page.url:
+                print("Instagram is showing a verification page in the browser window. "
+                      "Complete it there ...")
+                deadline = time.time() + LOGIN_TIMEOUT_S
+                while time.time() < deadline and ("challenge" in page.url or "checkpoint" in page.url):
+                    time.sleep(2)
+                page.goto(IG_URL, wait_until="domcontentloaded")
+                time.sleep(2)
         return context, page
 
     # Not logged in: make sure the window is visible so you can log in.
@@ -145,12 +155,24 @@ def api_get(page: Page, path: str, retries: int = 4, fatal: bool = True,
             throttled = True
         if res["status"] == 404 and not fatal:
             return None
-        if res["status"] in (401, 403) and not _is_logged_in(page.context):
+        # Instagram explains most refusals in a JSON "message" field.
+        try:
+            message = json.loads(res["text"]).get("message", "")
+        except (json.JSONDecodeError, AttributeError):
+            message = ""
+        if message in ("challenge_required", "checkpoint_required") or "checkpoint" in message:
+            sys.exit("\nInstagram wants you to confirm it's you before it serves more data.\n"
+                     "Run:  python track_follows.py --headed\n"
+                     "and complete the check in the browser window (then the run continues).")
+        if message == "login_required" or (res["status"] in (401, 403)
+                                           and not _is_logged_in(page.context)):
             sys.exit("Instagram logged you out. Delete browser_profile/ and run again.")
         if attempt == retries:
             break
         wait = 30 * (2 ** (attempt - 1)) if throttled else 3 * attempt
         what = "rate limit" if throttled else f"status {res['status']}"
+        if message:
+            what += f" ({message})"
         print(f"\n  Instagram {what}, waiting {wait}s before retry "
               f"({attempt}/{retries}) ...")
         time.sleep(wait)
